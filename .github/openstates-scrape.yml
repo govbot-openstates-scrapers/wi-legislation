@@ -5,10 +5,6 @@ on:
     - cron: "0 2 * * *"  # Daily at 2 AM UTC (~9 PM ET, ~6 PM PT)
   workflow_dispatch:
     inputs:
-      use-scrape-cache:
-        type: boolean
-        description: Use OpenStates scraper cache
-        default: false
       force-update:
         type: boolean
         description: "Force push even if upstream changed (use with caution)"
@@ -40,30 +36,67 @@ jobs:
         with:
           state: ${{ env.STATE_CODE }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          use-scrape-cache: ${{ inputs.use-scrape-cache }}
 
-  format:
-    name: "📝 Format Data"
-    runs-on: ubuntu-latest
-    needs: scrape
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout state repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download scrape artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.scrape.outputs.scrape-artifact-name }}
-
-      - name: Run formatter action
-        uses: windy-civi/toolkit/actions/format@main
-        with:
-          state: ${{ env.STATE_CODE }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          scrape-artifact-name: ${{ needs.scrape.outputs.scrape-artifact-name }}
-          force-update: ${{ inputs.force-update }}
+      - name: Commit and push scraped files
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Check if scraped files exist
+          if [ ! -d "_data/${{ env.STATE_CODE }}" ] || [ -z "$(ls -A "_data/${{ env.STATE_CODE }}" 2>/dev/null)" ]; then
+            echo "⚠️ No scraped files found in _data/${{ env.STATE_CODE }}/"
+            exit 0
+          fi
+          
+          # Configure git
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Add scraped files
+          git add "_data/${{ env.STATE_CODE }}/"
+          
+          # Commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🕷️ Scrape data for ${{ env.STATE_CODE }} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            
+            # Pull latest changes before pushing
+            echo "📥 Pulling latest changes..."
+            if ! git pull --no-rebase origin main 2>&1; then
+              echo "⚠️ Merge conflict detected, resolving..."
+              # In case of conflicts, keep our scraped files
+              git checkout --ours "_data/${{ env.STATE_CODE }}/" 2>/dev/null || true
+              git add "_data/${{ env.STATE_CODE }}/"
+              git commit --no-edit -m "🔄 Auto-merge: kept scraped data" || true
+            fi
+            
+            # Push with retries
+            PUSH_SUCCESS=false
+            for i in 1 2 3; do
+              if [ "${{ inputs.force-update }}" = "true" ]; then
+                if git push --force-with-lease origin main; then
+                  echo "✅ Changes pushed successfully (attempt $i)"
+                  PUSH_SUCCESS=true
+                  break
+                fi
+              else
+                if git push origin main; then
+                  echo "✅ Changes pushed successfully (attempt $i)"
+                  PUSH_SUCCESS=true
+                  break
+                fi
+              fi
+              
+              if [ $i -lt 3 ]; then
+                echo "⚠️ Push failed (attempt $i), pulling and retrying..."
+                git pull --no-rebase origin main || true
+                sleep 2
+              fi
+            done
+            
+            if [ "$PUSH_SUCCESS" = "false" ]; then
+              echo "❌ Failed to push after 3 attempts"
+              exit 1
+            fi
+          fi
